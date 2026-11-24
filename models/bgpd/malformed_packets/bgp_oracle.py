@@ -1,6 +1,17 @@
+"""Core BGP UPDATE attribute oracle from the August 20 scope.
+
+Models selected RFC 4271/7606 attribute flag, length and duplicate rules.
+Concrete payload checks cover AS_PATH framing. This module does not model
+OPEN negotiation, complete MP NLRI semantics or stateful GR behavior.
+"""
 from typing import List, Optional
 from dataclasses import dataclass
 from enum import IntEnum
+
+# These assigned path attributes have attribute-specific semantics that
+# this core oracle does not model. Symbolic entry points exclude them rather
+# than treating them as generic unknown attributes.
+UNMODELED_ASSIGNED_TYPES = (23, 25, 26, 29, 35, 39, 40)
 
 class ParseResult(IntEnum):
     # Numbered by severity (1 = most severe, 6 = least severe).
@@ -26,6 +37,7 @@ class BGPPathAttr:
     flags: int
     type_code: int
     length: int
+    value: Optional[bytes] = None
 
 def keep_most_severe(new_result: ParseResult, current_result: ParseResult) -> ParseResult:
     """
@@ -35,8 +47,41 @@ def keep_most_severe(new_result: ParseResult, current_result: ParseResult) -> Pa
     """
     return min(new_result, current_result)
 
-def parse_attributes(attrs: List[BGPPathAttr], is_ibgp: bool = False, impl_choice: Optional[ImplChoice] = None) -> ParseResult:
-    """Simulates comprehensive FRR bgp_attr_parse() logical branches for RFC 4271/7606."""
+def scan_as_path(value: bytes, asn_size: int,
+                 first_as: Optional[int] = None) -> bool:
+    """Check segment framing and the lab's optional eBGP first-AS policy.
+
+    This lab is not a confederation, so only AS_SET and AS_SEQUENCE are legal.
+    An empty AS_PATH is syntactically valid; first-AS policy rejects it.
+    """
+    if first_as is not None:
+        if (len(value) < 2 + asn_size or value[0] != 2 or value[1] == 0
+                or int.from_bytes(value[2:2 + asn_size], 'big') != first_as):
+            return False
+    idx = 0
+    while idx < len(value):
+        if idx + 2 > len(value):
+            return False
+        seg_type, seg_count = value[idx], value[idx + 1]
+        idx += 2
+        if seg_type not in (1, 2) or seg_count == 0:
+            return False
+        idx += seg_count * asn_size
+        if idx > len(value):
+            return False
+    return True
+
+
+def parse_attributes(attrs: List[BGPPathAttr], is_ibgp: bool = False,
+                     impl_choice: Optional[ImplChoice] = None,
+                     asn_4byte: bool = False,
+                     enforce_first_as: Optional[int] = None) -> ParseResult:
+    """Evaluate selected UPDATE rules. asn_4byte follows session negotiation.
+
+    value=None selects the legacy length-only model; concrete payloads
+    enable framing checks. External-neighbor handling retains the earlier
+    flag-first rules rather than the later peer-first changes.
+    """
     seen_origin = False
     seen_as_path = False
     seen_nexthop = False
@@ -65,11 +110,16 @@ def parse_attributes(attrs: List[BGPPathAttr], is_ibgp: bool = False, impl_choic
 
         if attr.type_code == 1: # ORIGIN
             seen_origin = True
-            if is_optional or not is_transitive or attr.length != 1:
+            if (is_optional or not is_transitive or attr.length != 1
+                    or (attr.value is not None
+                        and attr.value not in (b'\x00', b'\x01', b'\x02'))):
                 final_result = keep_most_severe(ParseResult.TREAT_AS_WITHDRAW, final_result)
         elif attr.type_code == 2: # AS_PATH
             seen_as_path = True
             if is_optional or not is_transitive:
+                final_result = keep_most_severe(ParseResult.TREAT_AS_WITHDRAW, final_result)
+            elif attr.value is not None and not scan_as_path(
+                    attr.value, 4 if asn_4byte else 2, enforce_first_as):
                 final_result = keep_most_severe(ParseResult.TREAT_AS_WITHDRAW, final_result)
         elif attr.type_code == 3: # NEXT_HOP
             seen_nexthop = True
@@ -79,48 +129,79 @@ def parse_attributes(attrs: List[BGPPathAttr], is_ibgp: bool = False, impl_choic
             if not is_optional or is_transitive or attr.length != 4:
                 final_result = keep_most_severe(ParseResult.TREAT_AS_WITHDRAW, final_result)
         elif attr.type_code == 5: # LOCAL_PREF
-            if is_optional or not is_transitive or attr.length != 4:
+            if is_optional or not is_transitive:
                 final_result = keep_most_severe(ParseResult.TREAT_AS_WITHDRAW, final_result)
             elif not is_ibgp:
-                # RFC 4271: If received from eBGP, it shall be ignored.
-                pass
+                # RFC 7606 section 7.5: discard LOCAL_PREF from an eBGP peer.
+                final_result = keep_most_severe(ParseResult.ATTRIBUTE_DISCARD, final_result)
+            elif attr.length != 4:
+                final_result = keep_most_severe(ParseResult.TREAT_AS_WITHDRAW, final_result)
         elif attr.type_code == 6: # ATOMIC_AGGREGATE
             if is_optional or not is_transitive or attr.length != 0:
                 final_result = keep_most_severe(ParseResult.ATTRIBUTE_DISCARD, final_result)
         elif attr.type_code == 7: # AGGREGATOR
-            if not is_optional or not is_transitive or attr.length != 6:
+            if not is_optional or not is_transitive or attr.length != (8 if asn_4byte else 6):
                 final_result = keep_most_severe(ParseResult.ATTRIBUTE_DISCARD, final_result)
         elif attr.type_code == 8: # COMMUNITY
-            if not is_optional or not is_transitive or (attr.length % 4 != 0):
+            if not is_optional or not is_transitive or attr.length == 0 or (attr.length % 4 != 0):
                 final_result = keep_most_severe(ParseResult.TREAT_AS_WITHDRAW, final_result)
         elif attr.type_code == 9: # ORIGINATOR_ID
-            if not is_optional or is_transitive or attr.length != 4:
+            if not is_optional or is_transitive:
+                final_result = keep_most_severe(ParseResult.TREAT_AS_WITHDRAW, final_result)
+            elif not is_ibgp:
+                final_result = keep_most_severe(ParseResult.ATTRIBUTE_DISCARD, final_result)
+            elif attr.length != 4:
                 final_result = keep_most_severe(ParseResult.TREAT_AS_WITHDRAW, final_result)
         elif attr.type_code == 10: # CLUSTER_LIST
-            if not is_optional or is_transitive or (attr.length % 4 != 0):
+            if not is_optional or is_transitive:
+                final_result = keep_most_severe(ParseResult.TREAT_AS_WITHDRAW, final_result)
+            elif not is_ibgp:
+                final_result = keep_most_severe(ParseResult.ATTRIBUTE_DISCARD, final_result)
+            elif attr.length == 0 or attr.length % 4 != 0:
                 final_result = keep_most_severe(ParseResult.TREAT_AS_WITHDRAW, final_result)
         elif attr.type_code == 14: # MP_REACH_NLRI
             if not is_optional or is_transitive:
                 choice = ParseResult(impl_choice.mp_nlri_choice.value) if impl_choice else ParseResult.IMPL_CHOICE
                 final_result = keep_most_severe(choice, final_result)
+            if attr.value is not None:
+                if len(attr.value) < 5: # Minimum AFI, SAFI, NH Len
+                    final_result = keep_most_severe(ParseResult.AFI_SAFI_DISABLE, final_result)
+                else:
+                    nh_len = attr.value[3]
+                    if len(attr.value) < 5 + nh_len:
+                        final_result = keep_most_severe(ParseResult.AFI_SAFI_DISABLE, final_result)
         elif attr.type_code == 15: # MP_UNREACH_NLRI
             if not is_optional or is_transitive:
                 choice = ParseResult(impl_choice.mp_nlri_choice.value) if impl_choice else ParseResult.IMPL_CHOICE
                 final_result = keep_most_severe(choice, final_result)
+            if attr.value is not None and len(attr.value) < 3: # Minimum AFI, SAFI
+                final_result = keep_most_severe(ParseResult.AFI_SAFI_DISABLE, final_result)
         elif attr.type_code == 16: # EXTENDED_COMMUNITIES
-            if not is_optional or not is_transitive or (attr.length % 8 != 0):
+            if not is_optional or not is_transitive or attr.length == 0 or (attr.length % 8 != 0):
                 final_result = keep_most_severe(ParseResult.TREAT_AS_WITHDRAW, final_result)
         elif attr.type_code == 17: # AS4_PATH
             if not is_optional or not is_transitive:
                 final_result = keep_most_severe(ParseResult.TREAT_AS_WITHDRAW, final_result)
+            elif asn_4byte:
+                # RFC 6793 section 6: peers that negotiated four-octet ASNs
+                # discard AS4_PATH; AS_PATH already carries the full path.
+                final_result = keep_most_severe(ParseResult.ATTRIBUTE_DISCARD, final_result)
+            elif attr.length < 6 or (attr.value is not None
+                                     and not scan_as_path(attr.value, 4)):
+                # RFC 6793 section 6: malformed AS4_PATH is discarded.
+                final_result = keep_most_severe(ParseResult.ATTRIBUTE_DISCARD, final_result)
         elif attr.type_code == 18: # AS4_AGGREGATOR
             if not is_optional or not is_transitive or attr.length != 8:
+                final_result = keep_most_severe(ParseResult.ATTRIBUTE_DISCARD, final_result)
+            elif asn_4byte:
+                # The companion attribute is also discarded on NEW/NEW peers.
                 final_result = keep_most_severe(ParseResult.ATTRIBUTE_DISCARD, final_result)
         elif attr.type_code == 22: # PMSI_TUNNEL
             if not is_optional or not is_transitive:
                 final_result = keep_most_severe(ParseResult.TREAT_AS_WITHDRAW, final_result)
         elif attr.type_code == 32: # LARGE_COMMUNITY
-            if not is_optional or not is_transitive:
+            if (not is_optional or not is_transitive or attr.length == 0
+                    or attr.length % 12 != 0):
                 final_result = keep_most_severe(ParseResult.TREAT_AS_WITHDRAW, final_result)
         elif attr.type_code == 128: # ATTR_SET (RFC 6368)
             if not is_optional:
